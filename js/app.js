@@ -333,9 +333,12 @@ const UI = {
   },
 
   tabs(active, vol) {
+    const isRecite = vol === 2;
+    const p1 = isRecite ? '#/recite' : '#/1';
+    const p2 = isRecite ? '#/recite/v2' : '#/2';
     return `<div class="tabs">
-      <button class="tab-btn ${active === 1 ? 'active' : ''}" onclick="location.hash='#/${vol === 2 ? 'recite' : ''}'" data-vol="1">三年级上</button>
-      <button class="tab-btn ${active === 2 ? 'active' : ''}" onclick="location.hash='#/${vol === 2 ? 'recite' : ''}'" data-vol="2">三年级下</button>
+      <button class="tab-btn ${active === 1 ? 'active' : ''}" onclick="location.hash='${p1}'">三年级上</button>
+      <button class="tab-btn ${active === 2 ? 'active' : ''}" onclick="location.hash='${p2}'">三年级下</button>
     </div>`;
   },
 
@@ -420,7 +423,8 @@ const UI = {
 
   /* 背诵列表 */
   reciteList() {
-    const vol = parseInt(location.hash.replace('#/recite', '').replace('/', '') || '1', 10) || 1;
+    const vm = location.hash.match(/v([12])/);
+    const vol = vm ? parseInt(vm[1], 10) : 1;
     const list = POEMS.filter(p => p.vol === vol);
     const html = this.topbar('背诵考核', '背诵 + 字词考试', false) + this.tabs(vol, 2) +
       `<div class="poem-list">` + list.map(p => {
@@ -781,8 +785,9 @@ const App = {
   route() {
     const h = location.hash.replace(/^#/, '') || '/';
     if (h === '/' ) { UI.home(); }
+    else if (/^\/[12]$/.test(h)) { UI.home(); }
     else if (/^\/poem\/(\d+)$/.test(h)) { UI.detail(parseInt(h.match(/^\/poem\/(\d+)$/)[1], 10)); }
-    else if (h === '/recite' || /^\/recite\/$/.test(h)) { UI.reciteList(); }
+    else if (h === '/recite' || /^\/recite\/$/.test(h) || /^\/recite\/v[12]$/.test(h)) { UI.reciteList(); }
     else if (/^\/recite\/(\d+)$/.test(h)) { UI.reciteDetail(parseInt(h.match(/^\/recite\/(\d+)$/)[1], 10)); }
     else if (/^\/quiz\/(\d+)$/.test(h)) { UI.quiz(parseInt(h.match(/^\/quiz\/(\d+)$/)[1], 10)); }
     else if (h === '/settings') { UI.settings(); }
