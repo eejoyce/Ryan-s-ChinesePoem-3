@@ -222,26 +222,95 @@ const WHISPER_FILES = [
   ['models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx', 10.3],
   ['models/Xenova/whisper-tiny/onnx/model.decoder.embed_tokens.weight_merged_0_quantized', 19.0]
 ];
-const WHISPER_TOTAL = WHISPER_FILES.reduce((s, f) => s + f[1], 0);
+const ORT_FILES = [
+  ['js/ort/ort-wasm-simd-threaded.wasm', 9.5],
+  ['js/ort/ort-wasm-simd.wasm', 9.6],
+  ['js/ort/ort-wasm.wasm', 8.8]
+];
+const ALL_MODEL_FILES = WHISPER_FILES.concat(ORT_FILES);
+const WHISPER_TOTAL = ALL_MODEL_FILES.reduce((s, f) => s + f[1], 0);
 let whisperDL = { active: false, pct: 0, done: false };
+
+/* 模型国内 CDN（jsDelivr 自动同步 GitHub 仓库，大陆可直连；多域名自动探测，失败回退同域） */
+const MODEL_CDNS = [
+  'https://cdn.jsdelivr.net/gh/eejoyce/Ryan-s-ChinesePoem-3@main/',
+  'https://gcore.jsdelivr.net/gh/eejoyce/Ryan-s-ChinesePoem-3@main/',
+  'https://fastly.jsdelivr.net/gh/eejoyce/Ryan-s-ChinesePoem-3@main/'
+];
+let MODEL_BASE = null; // null=未探测  ''=同域回退
+
+async function detectModelBase() {
+  if (MODEL_BASE !== null) return MODEL_BASE;
+  for (const cdn of MODEL_CDNS) {
+    try {
+      const r = await fetch(cdn + 'models/Xenova/whisper-tiny/config.json', { cache: 'force-cache' });
+      if (r.ok) { MODEL_BASE = cdn; return cdn; }
+    } catch (e) { /* 下一个 */ }
+  }
+  MODEL_BASE = ''; // CDN 均不可达 → 用同域（GitHub Pages 原路径）
+  return '';
+}
+function modelUrl(path) { return (MODEL_BASE || '') + path; }
+
+/* 注册 Service Worker（拦截模型请求，加速与缓存） */
+let swReady = false;
+async function registerSW() {
+  if (!('serviceWorker' in navigator) || swReady) return;
+  try {
+    await navigator.serviceWorker.register('sw.js');
+    await navigator.serviceWorker.ready;
+    swReady = true;
+  } catch (e) { swReady = false; }
+}
+
+/* 分块并发下载单个文件到 Cache API（同域 URL 为缓存键，SW 拦截时命中） */
+async function downloadToCache(path) {
+  const cache = await caches.open('poem-model-cache-v1');
+  const url = new URL(path, location.href).href;
+  if (await cache.match(url)) return true;
+  const remote = modelUrl(path);
+  try {
+    const head = await fetch(remote, { method: 'HEAD' });
+    const size = parseInt(head.headers.get('Content-Length') || '0', 10);
+    if (size > 0) {
+      const CHUNK = 3 * 1048576; // 3MB/块，并发下载
+      const jobs = [];
+      for (let s = 0; s < size; s += CHUNK) {
+        const end = Math.min(s + CHUNK, size) - 1;
+        jobs.push(fetch(remote, { headers: { Range: 'bytes=' + s + '-' + end } }).then(r => r.ok ? r.arrayBuffer() : null));
+      }
+      const parts = await Promise.all(jobs);
+      if (!parts.some(p => p === null)) {
+        const blob = new Blob(parts);
+        await cache.put(url, new Response(blob, { headers: { 'Content-Type': 'application/octet-stream' } }));
+        return true;
+      }
+    }
+    // 不支持 Range / HEAD → 整文件下载
+    const r = await fetch(remote);
+    if (r.ok) { await cache.put(url, r); return true; }
+  } catch (e) {
+    try { const r = await fetch(remote); if (r.ok) { await cache.put(url, r); return true; } } catch (e2) {}
+  }
+  return false;
+}
 
 async function predownloadWhisper() {
   if (whisperDL.active || whisperDL.done) return whisperDL.pct;
   whisperDL.active = true;
+  await detectModelBase();
+  registerSW().catch(() => {});
   let done = 0;
-  for (const [url] of WHISPER_FILES) {
-    try {
-      const r = await fetch(url, { cache: 'force-cache' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-    } catch (e) { /* 单个文件失败不中断，pipeline 阶段仍会尝试 */ }
+  for (const [path] of ALL_MODEL_FILES) {
+    await downloadToCache(path);
     done += 1;
-    whisperDL.pct = Math.round(done / WHISPER_FILES.length * 100);
+    whisperDL.pct = Math.round(done / ALL_MODEL_FILES.length * 100);
     UI.updateWhisperProgress();
   }
   whisperDL.active = false;
   whisperDL.done = true;
   UI.updateWhisperProgress();
-  // 预构建识别管线（此时文件已入缓存，加载很快）
+  // 预构建识别管线（此时文件已在缓存，加载很快）
   loadWhisper().catch(() => {});
   return whisperDL.pct;
 }
@@ -259,7 +328,7 @@ async function loadWhisper() {
     }
     const { pipeline, env } = mod;
     env.allowLocalModels = true;
-    env.localModelPath = 'models/';
+    env.localModelPath = 'models/'; // 同域路径（SW 拦截后从缓存/CDN 返回，加载快且稳）
     env.backends.onnx.wasm.wasmPaths = 'js/ort/';
     env.backends.onnx.wasm.numThreads = 1; // 静态托管无 COOP/COEP，禁用多线程
     whisperPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', { quantized: true, local_files_only: true });
@@ -466,7 +535,7 @@ const UI = {
     loadWhisper().catch(() => {});
     predownloadWhisper();
     const dlBar = !whisperDL.done
-      ? `<div class="dl-bar"><div class="dl-label" id="whisper-dl-label">语音识别模型下载中… ${whisperDL.pct}%</div><div class="dl-track"><i id="whisper-dl-fill" style="width:${whisperDL.pct}%"></i></div></div>`
+      ? `<div class="dl-bar"><div class="dl-label" id="whisper-dl-label">语音识别模型下载中（国内加速）… ${whisperDL.pct}%</div><div class="dl-track"><i id="whisper-dl-fill" style="width:${whisperDL.pct}%"></i></div></div>`
       : `<div class="dl-bar done"><div class="dl-label" id="whisper-dl-label">语音识别模型已就绪 ✓</div></div>`;
     const html = this.topbar('背诵考核', '背诵 + 字词考试', false) + this.tabs(vol, 2) + dlBar +
       `<div class="poem-list">` + list.map(p => {
@@ -567,7 +636,7 @@ const UI = {
   updateWhisperProgress() {
     const label = document.getElementById('whisper-dl-label');
     const fill = document.getElementById('whisper-dl-fill');
-    if (label) label.textContent = whisperDL.done ? '语音识别模型已就绪 ✓' : '语音识别模型下载中… ' + whisperDL.pct + '%';
+    if (label) label.textContent = whisperDL.done ? '语音识别模型已就绪 ✓' : '语音识别模型下载中（国内加速）… ' + whisperDL.pct + '%';
     if (fill) fill.style.width = whisperDL.pct + '%';
   },
   setNav(active) {
