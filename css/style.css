@@ -96,6 +96,16 @@ body {
 }
 .tab-btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
 
+/* 语音识别模型下载进度 */
+.dl-bar {
+  margin: 0 16px 6px; padding: 8px 12px; border-radius: 10px;
+  background: var(--primary-light); border: 1px solid var(--border);
+}
+.dl-bar.done { background: var(--card); }
+.dl-label { font-size: .82em; color: var(--text2); margin-bottom: 5px; }
+.dl-track { height: 6px; border-radius: 3px; background: rgba(0,0,0,.08); overflow: hidden; }
+.dl-track i { display: block; height: 100%; background: var(--primary); border-radius: 3px; transition: width .4s; }
+
 /* ===== 古诗列表 ===== */
 .poem-list { padding: 4px 16px 20px; }
 .poem-item {

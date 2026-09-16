@@ -211,6 +211,41 @@ function fixTTS(text) {
 /* 离线语音识别（Whisper tiny，浏览器本地运行，不依赖在线服务） */
 let whisperPipe = null, whisperLoading = false, whisperFailed = false, whisperRetryAt = 0;
 
+/* 语音识别模型文件清单（用于应用启动即后台预下载，走浏览器HTTP缓存，之后识别秒加载） */
+const WHISPER_FILES = [
+  ['models/Xenova/whisper-tiny/config.json', 0.01],
+  ['models/Xenova/whisper-tiny/preprocessor_config.json', 0.01],
+  ['models/Xenova/whisper-tiny/tokenizer_config.json', 0.01],
+  ['models/Xenova/whisper-tiny/generation_config.json', 0.01],
+  ['models/Xenova/whisper-tiny/tokenizer.json', 2.5],
+  ['models/Xenova/whisper-tiny/onnx/encoder_model_quantized.onnx', 9.7],
+  ['models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx', 10.3],
+  ['models/Xenova/whisper-tiny/onnx/model.decoder.embed_tokens.weight_merged_0_quantized', 19.0]
+];
+const WHISPER_TOTAL = WHISPER_FILES.reduce((s, f) => s + f[1], 0);
+let whisperDL = { active: false, pct: 0, done: false };
+
+async function predownloadWhisper() {
+  if (whisperDL.active || whisperDL.done) return whisperDL.pct;
+  whisperDL.active = true;
+  let done = 0;
+  for (const [url] of WHISPER_FILES) {
+    try {
+      const r = await fetch(url, { cache: 'force-cache' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    } catch (e) { /* 单个文件失败不中断，pipeline 阶段仍会尝试 */ }
+    done += 1;
+    whisperDL.pct = Math.round(done / WHISPER_FILES.length * 100);
+    UI.updateWhisperProgress();
+  }
+  whisperDL.active = false;
+  whisperDL.done = true;
+  UI.updateWhisperProgress();
+  // 预构建识别管线（此时文件已入缓存，加载很快）
+  loadWhisper().catch(() => {});
+  return whisperDL.pct;
+}
+
 async function loadWhisper() {
   if (whisperPipe) return whisperPipe;
   if (whisperFailed && Date.now() < whisperRetryAt) return null;
@@ -429,7 +464,11 @@ const UI = {
     const list = POEMS.filter(p => p.vol === vol);
     // 进入背诵页即后台预加载离线识别模型，录音评分时无需等待
     loadWhisper().catch(() => {});
-    const html = this.topbar('背诵考核', '背诵 + 字词考试', false) + this.tabs(vol, 2) +
+    predownloadWhisper();
+    const dlBar = !whisperDL.done
+      ? `<div class="dl-bar"><div class="dl-label" id="whisper-dl-label">语音识别模型下载中… ${whisperDL.pct}%</div><div class="dl-track"><i id="whisper-dl-fill" style="width:${whisperDL.pct}%"></i></div></div>`
+      : `<div class="dl-bar done"><div class="dl-label" id="whisper-dl-label">语音识别模型已就绪 ✓</div></div>`;
+    const html = this.topbar('背诵考核', '背诵 + 字词考试', false) + this.tabs(vol, 2) + dlBar +
       `<div class="poem-list">` + list.map(p => {
         const rs = getReciteScore(p.id);
         const qs = getQuizScore(p.id);
@@ -525,6 +564,12 @@ const UI = {
   },
 
   render(html) { this.app.innerHTML = html; },
+  updateWhisperProgress() {
+    const label = document.getElementById('whisper-dl-label');
+    const fill = document.getElementById('whisper-dl-fill');
+    if (label) label.textContent = whisperDL.done ? '语音识别模型已就绪 ✓' : '语音识别模型下载中… ' + whisperDL.pct + '%';
+    if (fill) fill.style.width = whisperDL.pct + '%';
+  },
   setNav(active) {
     document.querySelectorAll('.nav-btn').forEach(b => {
       b.classList.toggle('active', b.dataset.nav === active);
@@ -807,4 +852,6 @@ document.querySelectorAll('.nav-btn').forEach(b => {
 });
 window.App = App;
 App.route();
+// 应用启动即后台预下载语音识别模型（用户浏览期间完成，背诵评分无需等待）
+predownloadWhisper().catch(() => {});
 })();
