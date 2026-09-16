@@ -209,11 +209,11 @@ function fixTTS(text) {
 
 /* ---------- 工具 ---------- */
 /* 离线语音识别（Whisper tiny，浏览器本地运行，不依赖在线服务） */
-let whisperPipe = null, whisperLoading = false, whisperFailed = false;
+let whisperPipe = null, whisperLoading = false, whisperFailed = false, whisperRetryAt = 0;
 
 async function loadWhisper() {
   if (whisperPipe) return whisperPipe;
-  if (whisperFailed) return null;
+  if (whisperFailed && Date.now() < whisperRetryAt) return null;
   if (whisperLoading) { while (whisperLoading) await new Promise(r => setTimeout(r, 300)); return whisperPipe; }
   whisperLoading = true;
   try {
@@ -232,6 +232,7 @@ async function loadWhisper() {
     console.error('whisper load failed:', e);
     whisperPipe = null;
     whisperFailed = true;
+    whisperRetryAt = Date.now() + 20000; // 20秒后允许重试
   } finally {
     whisperLoading = false;
   }
@@ -426,6 +427,8 @@ const UI = {
     const vm = location.hash.match(/v([12])/);
     const vol = vm ? parseInt(vm[1], 10) : 1;
     const list = POEMS.filter(p => p.vol === vol);
+    // 进入背诵页即后台预加载离线识别模型，录音评分时无需等待
+    loadWhisper().catch(() => {});
     const html = this.topbar('背诵考核', '背诵 + 字词考试', false) + this.tabs(vol, 2) +
       `<div class="poem-list">` + list.map(p => {
         const rs = getReciteScore(p.id);
@@ -631,24 +634,20 @@ const App = {
     const hanText = p.content.join('').replace(/[^\u4e00-\u9fff]/g, '');
     const totalHan = countHan(hanText);
     const box = document.getElementById('score-box');
-    let score, mode;
-    // ① 在线语音识别结果
+    // ① 优先采用在线语音识别结果（若有）
     let transcript = (this.recText || '').replace(/[^\u4e00-\u9fff]/g, '');
-    let asrOk = this.asrActive && transcript.length >= Math.max(4, totalHan * 0.25);
-    if (!asrOk && this.recBlob && !whisperFailed) {
-      // ② 在线识别不可用 → 离线 Whisper 本地识别（不依赖网络服务）
+    let usedLocal = false;
+    if (transcript.length < 4 && this.recBlob && !whisperFailed) {
+      // ② 在线识别不可用/内容太少 → 离线 Whisper 本地识别（不依赖网络服务）
       if (box) {
         box.classList.remove('hidden');
         box.innerHTML = '<div class="big">⏳</div><div class="msg">正在本地语音识别（首次需加载约 40MB 模型，请稍候）…</div>';
       }
       const wtext = await whisperTranscribe(this.recBlob);
       const wclean = (wtext || '').replace(/[^\u4e00-\u9fff]/g, '');
-      if (wclean.length >= Math.max(4, totalHan * 0.25)) {
-        transcript = wclean;
-        asrOk = true;
-      }
+      if (wclean.length >= 4) { transcript = wclean; usedLocal = true; }
     }
-    if (asrOk) {
+    if (transcript.length >= 4) {
       // 逐字正确率评分（含同音容错）：原文用古诗音，识别文本用通用音
       const pyMap = buildPoemPyMap(p);
       const origChars = Array.from(hanText);
@@ -659,28 +658,29 @@ const App = {
         const bp = (PY_MAP && PY_MAP[b]) || '';
         return !!ap && !!bp && ap === bp;
       });
-      score = Math.round(match / totalHan * 100);
+      let score = Math.round(match / totalHan * 100);
       score = Math.max(0, Math.min(100, score));
-      mode = (this.asrActive && this.recText) ? 'asr-online' : 'asr-local';
-    } else {
-      // ③ 降级：按朗读时长估算
-      const ref = totalHan * 0.55;
-      const dev = Math.abs(dur - ref) / ref;
-      score = Math.round(100 - dev * 35);
-      score = Math.max(55, Math.min(100, score));
-      mode = 'time';
-    }
-    const best = setReciteScore(id, score);
-    box.classList.remove('hidden');
-    const modeTxt = mode === 'asr-online'
-      ? '逐字正确率评分（在线语音识别）'
-      : mode === 'asr-local'
+      const best = setReciteScore(id, score);
+      box.classList.remove('hidden');
+      const modeTxt = usedLocal
         ? '逐字正确率评分（本地语音识别）'
-        : '未能识别语音，按时长估算（请靠近麦克风清晰朗读）';
-    box.innerHTML = `<div class="big">${score} 分</div>
-      <div class="stars">${stars(score)}</div>
-      <div class="msg">${score >= 90 ? '太棒了！背得又快又准！🎉' : score >= 80 ? '非常好！继续加油！' : score >= 70 ? '不错哦，再练几次会更好！' : '多听几遍朗读，你会背得更好！'}</div>
-      <div class="msg" style="margin-top:6px;font-size:.8em">${modeTxt} · 用时 ${dur.toFixed(1)}秒 · 最佳成绩 ${best}分</div>`;
+        : '逐字正确率评分（在线语音识别）';
+      box.innerHTML = `<div class="big">${score} 分</div>
+        <div class="stars">${stars(score)}</div>
+        <div class="msg">${score >= 90 ? '太棒了！背得又快又准！🎉' : score >= 80 ? '非常好！继续加油！' : score >= 70 ? '不错哦，再练几次会更好！' : '多听几遍朗读，你会背得更好！'}</div>
+        <div class="msg" style="margin-top:6px;font-size:.8em">${modeTxt} · 用时 ${dur.toFixed(1)}秒 · 最佳成绩 ${best}分</div>`;
+      const playBtn = document.getElementById('play-rec');
+      playBtn.disabled = false;
+      return;
+    }
+    // ③ 语音识别完全失败：不按时长评分，明确提示后让用户重试
+    const reason = whisperFailed
+      ? '离线语音识别模型加载失败（请用 Edge / Chrome 浏览器打开，并保持网络通畅后重试）'
+      : '未能识别到清晰语音（请靠近麦克风、放慢语速重新背诵，或在 Edge / Chrome 浏览器中打开）';
+    box.classList.remove('hidden');
+    box.innerHTML = `<div class="big">--</div>
+      <div class="msg">${reason}</div>
+      <div class="msg" style="margin-top:6px;font-size:.8em">录音已保存可回放 · 点击🎤重新背诵</div>`;
     const playBtn = document.getElementById('play-rec');
     playBtn.disabled = false;
   },
