@@ -317,7 +317,10 @@ async function predownloadWhisper() {
 
 async function loadWhisper() {
   if (whisperPipe) return whisperPipe;
-  if (whisperFailed && Date.now() < whisperRetryAt) return null;
+  // 上次加载失败处于冷却期：等待冷却结束再重试（评分流程会一直等到可用或再次失败）
+  while (whisperFailed && Date.now() < whisperRetryAt) {
+    await new Promise(r => setTimeout(r, 400));
+  }
   if (whisperLoading) { while (whisperLoading) await new Promise(r => setTimeout(r, 300)); return whisperPipe; }
   whisperLoading = true;
   try {
@@ -336,7 +339,7 @@ async function loadWhisper() {
     console.error('whisper load failed:', e);
     whisperPipe = null;
     whisperFailed = true;
-    whisperRetryAt = Date.now() + 20000; // 20秒后允许重试
+    whisperRetryAt = Date.now() + 5000; // 5秒后允许重试
   } finally {
     whisperLoading = false;
   }
@@ -344,9 +347,10 @@ async function loadWhisper() {
 }
 
 /* 录音 blob → 文本（16kHz 重采样后喂给 Whisper） */
+let whisperLastError = '';
 async function whisperTranscribe(blob) {
   const pipe = await loadWhisper();
-  if (!pipe) return '';
+  if (!pipe) { whisperLastError = '模型未就绪'; return ''; }
   try {
     const arrayBuf = await blob.arrayBuffer();
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -359,9 +363,11 @@ async function whisperTranscribe(blob) {
     const out = new Float32Array(len);
     for (let i = 0; i < len; i++) out[i] = src[Math.floor(i * ratio)];
     const res = await pipe(out, { language: 'zh', task: 'transcribe' });
+    whisperLastError = '';
     return (res && res.text) ? res.text : '';
   } catch (e) {
     console.error('whisper transcribe failed:', e);
+    whisperLastError = String(e).slice(0, 150);
     return '';
   }
 }
@@ -531,8 +537,8 @@ const UI = {
     const vm = location.hash.match(/v([12])/);
     const vol = vm ? parseInt(vm[1], 10) : 1;
     const list = POEMS.filter(p => p.vol === vol);
-    // 进入背诵页即后台预加载离线识别模型，录音评分时无需等待
-    loadWhisper().catch(() => {});
+    // 预下载在应用启动时已开始（predownloadWhisper），完成后会自动构建识别管线；
+    // 此处不提前 loadWhisper，避免缓存未就绪时抢跑失败进入冷却期
     predownloadWhisper();
     const dlBar = !whisperDL.done
       ? `<div class="dl-bar"><div class="dl-label" id="whisper-dl-label">语音识别模型下载中（国内加速）… ${whisperDL.pct}%</div><div class="dl-track"><i id="whisper-dl-fill" style="width:${whisperDL.pct}%"></i></div></div>`
@@ -755,7 +761,9 @@ const App = {
       // ② 在线识别不可用/内容太少 → 离线 Whisper 本地识别（不依赖网络服务）
       if (box) {
         box.classList.remove('hidden');
-        box.innerHTML = '<div class="big">⏳</div><div class="msg">正在本地语音识别（首次需加载约 40MB 模型，请稍候）…</div>';
+        box.innerHTML = whisperDL.done
+          ? '<div class="big">⏳</div><div class="msg">正在本地语音识别…</div>'
+          : '<div class="big">⏳</div><div class="msg">正在加载语音识别模型（首次约 40MB，请稍候）…</div>';
       }
       const wtext = await whisperTranscribe(this.recBlob);
       const wclean = (wtext || '').replace(/[^\u4e00-\u9fff]/g, '');
@@ -779,10 +787,13 @@ const App = {
       const modeTxt = usedLocal
         ? '逐字正确率评分（本地语音识别）'
         : '逐字正确率评分（在线语音识别）';
+      const lowHint = match < totalHan * 0.4
+        ? `<div class="msg" style="margin-top:6px;font-size:.8em;color:#c0392b">⚠️ 识别到 ${match}/${totalHan} 字，内容较少：请靠近麦克风、环境安静、放慢语速后重新背诵会更准</div>`
+        : '';
       box.innerHTML = `<div class="big">${score} 分</div>
         <div class="stars">${stars(score)}</div>
         <div class="msg">${score >= 90 ? '太棒了！背得又快又准！🎉' : score >= 80 ? '非常好！继续加油！' : score >= 70 ? '不错哦，再练几次会更好！' : '多听几遍朗读，你会背得更好！'}</div>
-        <div class="msg" style="margin-top:6px;font-size:.8em">${modeTxt} · 用时 ${dur.toFixed(1)}秒 · 最佳成绩 ${best}分</div>`;
+        <div class="msg" style="margin-top:6px;font-size:.8em">${modeTxt} · 用时 ${dur.toFixed(1)}秒 · 最佳成绩 ${best}分</div>${lowHint}`;
       const playBtn = document.getElementById('play-rec');
       playBtn.disabled = false;
       return;
@@ -791,9 +802,13 @@ const App = {
     const reason = whisperFailed
       ? '离线语音识别模型加载失败（请用 Edge / Chrome 浏览器打开，并保持网络通畅后重试）'
       : '未能识别到清晰语音（请靠近麦克风、放慢语速重新背诵，或在 Edge / Chrome 浏览器中打开）';
+    const dbg = whisperFailed
+      ? '模型状态：加载失败' + (whisperLastError ? ' · ' + whisperLastError : '')
+      : (whisperLastError ? '识别异常：' + whisperLastError : '');
     box.classList.remove('hidden');
     box.innerHTML = `<div class="big">--</div>
       <div class="msg">${reason}</div>
+      ${dbg ? `<div class="msg" style="margin-top:6px;font-size:.72em;color:#7f8c8d">${esc(dbg)}</div>` : ''}
       <div class="msg" style="margin-top:6px;font-size:.8em">录音已保存可回放 · 点击🎤重新背诵</div>`;
     const playBtn = document.getElementById('play-rec');
     playBtn.disabled = false;
