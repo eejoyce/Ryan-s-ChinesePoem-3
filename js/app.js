@@ -219,8 +219,7 @@ const WHISPER_FILES = [
   ['models/Xenova/whisper-tiny/generation_config.json', 0.01],
   ['models/Xenova/whisper-tiny/tokenizer.json', 2.5],
   ['models/Xenova/whisper-tiny/onnx/encoder_model_quantized.onnx', 9.7],
-  ['models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx', 10.3],
-  ['models/Xenova/whisper-tiny/onnx/model.decoder.embed_tokens.weight_merged_0_quantized', 19.0]
+  ['models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx', 29.3]
 ];
 const ORT_FILES = [
   ['js/ort/ort-wasm-simd-threaded.wasm', 4.8],
@@ -264,12 +263,17 @@ async function registerSW() {
 }
 
 /* 分块并发下载单个文件到 Cache API（同域 URL 为缓存键，SW 拦截时命中） */
-const MODEL_CACHE_NAME = 'poem-model-cache-v3'; // v2：整文件下载更稳（v1 的 Range 分块在 jsDelivr 上不稳定）
+const MODEL_CACHE_NAME = 'poem-model-cache-v3'; // v3：大文件同域直连（jsDelivr 有 20MB 限制）
+// 必须同域（GitHub Pages）直连的文件：超 20MB（jsDelivr 拒 403）或 jsDelivr 缓存旧版本不可靠
+const BIG_FILES = [
+  'models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx',
+  'js/ort/ort-wasm-simd-threaded.wasm'
+];
 async function downloadToCache(path) {
   const cache = await caches.open(MODEL_CACHE_NAME);
   const url = new URL(path, location.href).href;
   if (await cache.match(url)) return true;
-  const remote = modelUrl(path);
+  const remote = BIG_FILES.includes(path) ? url : modelUrl(path);
   // 整文件下载（jsDelivr 单文件下载稳定；文件间并行由 predownloadWhisper 分批控制）
   try {
     const r = await fetch(remote);

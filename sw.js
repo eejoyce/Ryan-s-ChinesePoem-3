@@ -1,9 +1,9 @@
-/* 背古诗词搭子 · Service Worker
+﻿/* 背古诗词搭子 · Service Worker
  * 拦截语音识别模型 / 推理引擎请求：
  *   1. 优先从 Cache API 返回（预下载已缓存 → 秒加载）
  *   2. 未命中 → 从 jsDelivr CDN（大陆可直连）回源并缓存
  * 使识别模型加载既快又稳，不依赖 GitHub Pages 直连速度。 */
-const CACHE = 'poem-model-cache-v1';
+const CACHE = 'poem-model-cache-v3';
 const CDN = 'https://cdn.jsdelivr.net/gh/eejoyce/Ryan-s-ChinesePoem-3@main';
 const MODEL_PATH = '/models/Xenova/whisper-tiny/';
 const ORT_PATH = '/js/ort/';
@@ -21,6 +21,10 @@ self.addEventListener('fetch', (e) => {
     const cache = await caches.open(CACHE);
     const hit = await cache.match(e.request);
     if (hit) return hit;
+    // 必须同域（GitHub Pages）回源：超 20MB（jsDelivr 拒 403）或 jsDelivr 缓存旧版本不可靠
+    if (url.pathname.includes('decoder_model_merged_quantized.onnx') || url.pathname.includes('ort-wasm-simd-threaded.wasm')) {
+      try { return await fetch(e.request); } catch (err) { return new Response('', { status: 502 }); }
+    }
     try {
       const remote = CDN + url.pathname;
       const resp = await fetch(remote, { mode: 'cors' });
