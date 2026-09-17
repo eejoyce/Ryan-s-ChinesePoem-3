@@ -1,4 +1,4 @@
-/* ===== 背古诗词搭子 · 应用逻辑 ===== */
+﻿/* ===== 背古诗词搭子 · 应用逻辑 ===== */
 (function () {
 'use strict';
 
@@ -223,10 +223,8 @@ const WHISPER_FILES = [
   ['models/Xenova/whisper-tiny/onnx/model.decoder.embed_tokens.weight_merged_0_quantized', 19.0]
 ];
 const ORT_FILES = [
-  ['js/ort/ort-wasm-simd-threaded.jsep.wasm', 20.9],
-  ['js/ort/ort-wasm-simd-threaded.jsep.mjs', 0.05],
   ['js/ort/ort-wasm-simd-threaded.wasm', 4.8],
-  ['js/ort/ort-wasm-simd-threaded.mjs', 0.04]
+  ['js/ort/ort-wasm-simd-threaded.mjs', 0.05]
 ];
 const ALL_MODEL_FILES = WHISPER_FILES.concat(ORT_FILES);
 const WHISPER_TOTAL = ALL_MODEL_FILES.reduce((s, f) => s + f[1], 0);
@@ -266,7 +264,7 @@ async function registerSW() {
 }
 
 /* 分块并发下载单个文件到 Cache API（同域 URL 为缓存键，SW 拦截时命中） */
-const MODEL_CACHE_NAME = 'poem-model-cache-v2'; // v2：整文件下载更稳（v1 的 Range 分块在 jsDelivr 上不稳定）
+const MODEL_CACHE_NAME = 'poem-model-cache-v3'; // v2：整文件下载更稳（v1 的 Range 分块在 jsDelivr 上不稳定）
 async function downloadToCache(path) {
   const cache = await caches.open(MODEL_CACHE_NAME);
   const url = new URL(path, location.href).href;
@@ -358,8 +356,8 @@ async function loadWhisper() {
     env.localModelPath = 'models/'; // 同域路径（SW 拦截后从缓存/CDN 返回，加载快且稳）
     const wasmBase = new URL('js/ort/', location.href).href; // 必须绝对 URL，否则 import 解析失败
     env.backends.onnx.wasm.wasmPaths = {
-      mjs: wasmBase + 'ort-wasm-simd-threaded.jsep.mjs',
-      wasm: wasmBase + 'ort-wasm-simd-threaded.jsep.wasm'
+      mjs: wasmBase + 'ort-wasm-simd-threaded.mjs',
+      wasm: wasmBase + 'ort-wasm-simd-threaded.wasm'
     };
     env.backends.onnx.wasm.numThreads = 1; // 静态托管无 COOP/COEP，禁用多线程
     whisperPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', { quantized: true, local_files_only: true });
@@ -955,7 +953,7 @@ const App = {
   async redownloadModels() {
     if (!confirm('将清除并重新下载语音识别模型（约 68MB），确定吗？')) return;
     try { await caches.delete('poem-model-cache-v1'); } catch (e) {}
-    try { await caches.delete('poem-model-cache-v2'); } catch (e) {}
+    try { await caches.delete('poem-model-cache-v3'); } catch (e) {}
     try { await caches.delete('transformers-cache'); } catch (e) {}
     whisperPipe = null; whisperFailed = false; whisperRetryAt = 0; whisperLoadError = '';
     whisperDL.done = false; whisperDL.pct = 0; whisperDL.active = false; whisperDLFail = [];
