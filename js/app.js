@@ -222,8 +222,8 @@ const WHISPER_FILES = [
   ['models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx', 29.3]
 ];
 const ORT_FILES = [
-  ['js/ort/ort-wasm-simd-threaded.wasm', 4.8],
-  ['js/ort/ort-wasm-simd-threaded.mjs', 0.05]
+  ['js/ort/ort-wasm-122.wasm', 10.7],
+  ['js/ort/ort-wasm-122.mjs', 0.05]
 ];
 const ALL_MODEL_FILES = WHISPER_FILES.concat(ORT_FILES);
 const WHISPER_TOTAL = ALL_MODEL_FILES.reduce((s, f) => s + f[1], 0);
@@ -263,19 +263,72 @@ async function registerSW() {
 }
 
 /* 分块并发下载单个文件到 Cache API（同域 URL 为缓存键，SW 拦截时命中） */
-const MODEL_CACHE_NAME = 'poem-model-cache-v3'; // v3：大文件同域直连（jsDelivr 有 20MB 限制）
-// 必须同域（GitHub Pages）直连的文件：超 20MB（jsDelivr 拒 403）或 jsDelivr 缓存旧版本不可靠
+const MODEL_CACHE_NAME = 'poem-model-cache-v4'; // v4：wasm 改名走 jsDelivr；decoder 用 Range 分块并发（GitHub Pages 慢速直连提速 5-8 倍）
+// 必须同域（GitHub Pages）直连的文件：超 20MB（jsDelivr 拒 403），用 Range 分块并发加速
 const BIG_FILES = [
-  'models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx',
-  'js/ort/ort-wasm-simd-threaded.wasm'
+  'models/Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx'
 ];
+const CHUNK_MB = 3; // 每块 3MB
+const CHUNK_CONC = 6; // 并发块数
+
+/* 大文件：Range 分块并发下载（GitHub Pages 单连接慢速，并发 6 块可提速 5-8 倍） */
+async function downloadChunked(path, url) {
+  const total = 30727765; // decoder_model_merged_quantized.onnx 字节数
+  const chunkSize = CHUNK_MB * 1024 * 1024;
+  const chunks = [];
+  for (let s = 0; s < total; s += chunkSize) {
+    chunks.push({ start: s, end: Math.min(s + chunkSize - 1, total - 1) });
+  }
+  const results = new Array(chunks.length);
+  let full = null; // 服务器不支持 Range 时返回全文
+  let cursor = 0;
+  async function worker() {
+    while (cursor < chunks.length) {
+      if (full) return true;
+      const idx = cursor++;
+      const c = chunks[idx];
+      let ok = false;
+      for (let retry = 0; retry < 4 && !ok; retry++) {
+        try {
+          const r = await fetch(url, { headers: { Range: 'bytes=' + c.start + '-' + c.end } });
+          if (r.status === 200) {
+            const buf = await r.arrayBuffer();
+            if (!full) full = buf;
+            ok = true;
+          } else if (r.status === 206) {
+            results[idx] = await r.arrayBuffer();
+            ok = true;
+          }
+        } catch (e) {}
+        if (!ok) await new Promise(r => setTimeout(r, 800 + retry * 500));
+      }
+      if (!ok) return false;
+    }
+    return true;
+  }
+  const workers = [];
+  for (let i = 0; i < CHUNK_CONC; i++) workers.push(worker());
+  const all = await Promise.all(workers);
+  if (all.some(v => v === false)) return null;
+  if (full) return full;
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const b of results) { buf.set(new Uint8Array(b), off); off += b.byteLength; }
+  return buf.buffer;
+}
+
 async function downloadToCache(path) {
   const cache = await caches.open(MODEL_CACHE_NAME);
   const url = new URL(path, location.href).href;
   if (await cache.match(url)) return true;
   const remote = BIG_FILES.includes(path) ? url : modelUrl(path);
-  // 整文件下载（jsDelivr 单文件下载稳定；文件间并行由 predownloadWhisper 分批控制）
   try {
+    if (BIG_FILES.includes(path)) {
+      const buf = await downloadChunked(path, remote);
+      if (!buf) return false;
+      await cache.put(url, new Response(buf, { headers: { 'Content-Type': 'application/octet-stream' } }));
+      return true;
+    }
     const r = await fetch(remote);
     if (r.ok) { await cache.put(url, r.clone()); return true; }
   } catch (e) {}
@@ -376,8 +429,8 @@ async function loadWhisper() {
     env.localModelPath = 'models/'; // 同域路径（SW 拦截后从缓存/CDN 返回，加载快且稳）
     const wasmBase = new URL('js/ort/', location.href).href; // 必须绝对 URL，否则 import 解析失败
     env.backends.onnx.wasm.wasmPaths = {
-      mjs: wasmBase + 'ort-wasm-simd-threaded.mjs',
-      wasm: wasmBase + 'ort-wasm-simd-threaded.wasm'
+      mjs: wasmBase + 'ort-wasm-122.mjs',
+      wasm: wasmBase + 'ort-wasm-122.wasm'
     };
     env.backends.onnx.wasm.numThreads = 1; // 静态托管无 COOP/COEP，禁用多线程
     whisperPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', { quantized: true, local_files_only: true });
@@ -685,7 +738,7 @@ const UI = {
       </div>
       <div class="set-group">
         <div class="sg-title">📊 数据</div>
-        <div class="set-row"><button class="btn" style="width:100%;padding:12px;border:none;border-radius:12px;background:var(--primary);color:#fff;font-size:.95em;font-weight:700;cursor:pointer" onclick="App.redownloadModels()">🔄 重新下载识别模型（约68MB）</button></div>
+        <div class="set-row"><button class="btn" style="width:100%;padding:12px;border:none;border-radius:12px;background:var(--primary);color:#fff;font-size:.95em;font-weight:700;cursor:pointer" onclick="App.redownloadModels()">🔄 重新下载识别模型（约52MB）</button></div>
         <div class="set-row"><button class="btn" style="width:100%;padding:12px;border:none;border-radius:12px;background:#e74c3c;color:#fff;font-size:.95em;font-weight:700;cursor:pointer" onclick="App.clearData()">清空所有学习数据</button></div>
       </div>
     </div>`;
@@ -976,7 +1029,7 @@ const App = {
   async redownloadModels() {
     if (!confirm('将清除并重新下载语音识别模型（约 68MB），确定吗？')) return;
     try { await caches.delete('poem-model-cache-v1'); } catch (e) {}
-    try { await caches.delete('poem-model-cache-v3'); } catch (e) {}
+    try { await caches.delete('poem-model-cache-v4'); } catch (e) {}
     try { await caches.delete('transformers-cache'); } catch (e) {}
     whisperPipe = null; whisperFailed = false; whisperRetryAt = 0; whisperLoadError = '';
     whisperDL.done = false; whisperDL.pct = 0; whisperDL.active = false; whisperDLFail = [];
