@@ -223,13 +223,15 @@ const WHISPER_FILES = [
   ['models/Xenova/whisper-tiny/onnx/model.decoder.embed_tokens.weight_merged_0_quantized', 19.0]
 ];
 const ORT_FILES = [
-  ['js/ort/ort-wasm-simd-threaded.wasm', 9.5],
-  ['js/ort/ort-wasm-simd.wasm', 9.6],
-  ['js/ort/ort-wasm.wasm', 8.8]
+  ['js/ort/ort-wasm-simd-threaded.jsep.wasm', 20.9],
+  ['js/ort/ort-wasm-simd-threaded.jsep.mjs', 0.05],
+  ['js/ort/ort-wasm-simd-threaded.wasm', 4.8],
+  ['js/ort/ort-wasm-simd-threaded.mjs', 0.04]
 ];
 const ALL_MODEL_FILES = WHISPER_FILES.concat(ORT_FILES);
 const WHISPER_TOTAL = ALL_MODEL_FILES.reduce((s, f) => s + f[1], 0);
 let whisperDL = { active: false, pct: 0, done: false };
+let whisperDLFail = []; // 下载失败的文件（后台自动重试中）
 
 /* 模型国内 CDN（jsDelivr 自动同步 GitHub 仓库，大陆可直连；多域名自动探测，失败回退同域） */
 const MODEL_CDNS = [
@@ -264,34 +266,17 @@ async function registerSW() {
 }
 
 /* 分块并发下载单个文件到 Cache API（同域 URL 为缓存键，SW 拦截时命中） */
+const MODEL_CACHE_NAME = 'poem-model-cache-v2'; // v2：整文件下载更稳（v1 的 Range 分块在 jsDelivr 上不稳定）
 async function downloadToCache(path) {
-  const cache = await caches.open('poem-model-cache-v1');
+  const cache = await caches.open(MODEL_CACHE_NAME);
   const url = new URL(path, location.href).href;
   if (await cache.match(url)) return true;
   const remote = modelUrl(path);
+  // 整文件下载（jsDelivr 单文件下载稳定；文件间并行由 predownloadWhisper 分批控制）
   try {
-    const head = await fetch(remote, { method: 'HEAD' });
-    const size = parseInt(head.headers.get('Content-Length') || '0', 10);
-    if (size > 0) {
-      const CHUNK = 3 * 1048576; // 3MB/块，并发下载
-      const jobs = [];
-      for (let s = 0; s < size; s += CHUNK) {
-        const end = Math.min(s + CHUNK, size) - 1;
-        jobs.push(fetch(remote, { headers: { Range: 'bytes=' + s + '-' + end } }).then(r => r.ok ? r.arrayBuffer() : null));
-      }
-      const parts = await Promise.all(jobs);
-      if (!parts.some(p => p === null)) {
-        const blob = new Blob(parts);
-        await cache.put(url, new Response(blob, { headers: { 'Content-Type': 'application/octet-stream' } }));
-        return true;
-      }
-    }
-    // 不支持 Range / HEAD → 整文件下载
     const r = await fetch(remote);
-    if (r.ok) { await cache.put(url, r); return true; }
-  } catch (e) {
-    try { const r = await fetch(remote); if (r.ok) { await cache.put(url, r); return true; } } catch (e2) {}
-  }
+    if (r.ok) { await cache.put(url, r.clone()); return true; }
+  } catch (e) {}
   return false;
 }
 
@@ -301,19 +286,56 @@ async function predownloadWhisper() {
   await detectModelBase();
   registerSW().catch(() => {});
   let done = 0;
-  for (const [path] of ALL_MODEL_FILES) {
-    await downloadToCache(path);
-    done += 1;
-    whisperDL.pct = Math.round(done / ALL_MODEL_FILES.length * 100);
-    UI.updateWhisperProgress();
+  whisperDLFail = [];
+  // 4 个文件一批并行整文件下载（jsDelivr 并发过多可能被限流）
+  for (let i = 0; i < ALL_MODEL_FILES.length; i += 4) {
+    const batch = ALL_MODEL_FILES.slice(i, i + 4);
+    await Promise.all(batch.map(async ([path]) => {
+      let ok = false;
+      for (let attempt = 0; attempt < 3 && !ok; attempt++) { // 每个文件最多重试3次
+        ok = await downloadToCache(path);
+        if (!ok) await new Promise(r => setTimeout(r, 1500));
+      }
+      if (!ok) whisperDLFail.push(path);
+      done += 1;
+      whisperDL.pct = Math.round(done / ALL_MODEL_FILES.length * 100);
+      UI.updateWhisperProgress();
+    }));
   }
   whisperDL.active = false;
-  whisperDL.done = true;
-  UI.updateWhisperProgress();
-  // 预构建识别管线（此时文件已在缓存，加载很快）
-  loadWhisper().catch(() => {});
+  if (whisperDLFail.length === 0) {
+    whisperDL.done = true;
+    UI.updateWhisperProgress();
+    // 预构建识别管线（此时文件已全部在缓存，加载很快）
+    loadWhisper().catch(() => {});
+  } else {
+    UI.updateWhisperProgress();
+    scheduleModelRetry(); // 有失败文件 → 后台定时重试
+  }
   return whisperDL.pct;
 }
+
+/* 失败文件的后台自动重试（每 30 秒一轮，全部成功才标记就绪） */
+function scheduleModelRetry() {
+  setTimeout(async () => {
+    if (whisperDL.done) return;
+    for (const path of whisperDLFail.slice()) {
+      const ok = await downloadToCache(path);
+      if (ok) whisperDLFail.splice(whisperDLFail.indexOf(path), 1);
+    }
+    UI.updateWhisperProgress();
+    if (whisperDLFail.length === 0) {
+      whisperDL.done = true;
+      UI.updateWhisperProgress();
+      loadWhisper().catch(() => {});
+    } else {
+      scheduleModelRetry();
+    }
+  }, 30000);
+}
+
+/* 语音识别模型加载错误详情（用于页面诊断显示） */
+let whisperLoadError = '';
 
 async function loadWhisper() {
   if (whisperPipe) return whisperPipe;
@@ -330,13 +352,21 @@ async function loadWhisper() {
       window.__transformersModule = mod;
     }
     const { pipeline, env } = mod;
+    // 清除可能残留的坏缓存（早期失败/中断下载留下的不完整文件会导致加载持续失败）
+    try { await caches.delete('transformers-cache'); } catch (e) {}
     env.allowLocalModels = true;
     env.localModelPath = 'models/'; // 同域路径（SW 拦截后从缓存/CDN 返回，加载快且稳）
-    env.backends.onnx.wasm.wasmPaths = 'js/ort/';
+    const wasmBase = new URL('js/ort/', location.href).href; // 必须绝对 URL，否则 import 解析失败
+    env.backends.onnx.wasm.wasmPaths = {
+      mjs: wasmBase + 'ort-wasm-simd-threaded.jsep.mjs',
+      wasm: wasmBase + 'ort-wasm-simd-threaded.jsep.wasm'
+    };
     env.backends.onnx.wasm.numThreads = 1; // 静态托管无 COOP/COEP，禁用多线程
     whisperPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', { quantized: true, local_files_only: true });
+    whisperLoadError = '';
   } catch (e) {
     console.error('whisper load failed:', e);
+    whisperLoadError = String(e && e.message || e) + (e && e.stack ? ' || ' + String(e.stack).slice(0, 300) : '');
     whisperPipe = null;
     whisperFailed = true;
     whisperRetryAt = Date.now() + 5000; // 5秒后允许重试
@@ -540,9 +570,15 @@ const UI = {
     // 预下载在应用启动时已开始（predownloadWhisper），完成后会自动构建识别管线；
     // 此处不提前 loadWhisper，避免缓存未就绪时抢跑失败进入冷却期
     predownloadWhisper();
-    const dlBar = !whisperDL.done
+    const failLine = whisperDLFail.length
+      ? `<div class="dl-bar err"><div class="dl-label" id="whisper-dl-label">⚠️ 有 ${whisperDLFail.length} 个模型文件下载失败，正在自动重试（请保持页面打开）…</div></div>`
+      : '';
+    const errLine = whisperLoadError
+      ? `<div class="dl-bar err"><div class="dl-label" id="whisper-dl-label">⚠️ 模型加载异常：${esc(whisperLoadError.slice(0, 120))}</div><div class="dl-label" style="margin-top:4px">可到「设置」页点「重新下载识别模型」，或刷新页面重试</div></div>`
+      : '';
+    const dlBar = failLine || errLine || (!whisperDL.done
       ? `<div class="dl-bar"><div class="dl-label" id="whisper-dl-label">语音识别模型下载中（国内加速）… ${whisperDL.pct}%</div><div class="dl-track"><i id="whisper-dl-fill" style="width:${whisperDL.pct}%"></i></div></div>`
-      : `<div class="dl-bar done"><div class="dl-label" id="whisper-dl-label">语音识别模型已就绪 ✓</div></div>`;
+      : `<div class="dl-bar done"><div class="dl-label" id="whisper-dl-label">语音识别模型已就绪 ✓</div></div>`);
     const html = this.topbar('背诵考核', '背诵 + 字词考试', false) + this.tabs(vol, 2) + dlBar +
       `<div class="poem-list">` + list.map(p => {
         const rs = getReciteScore(p.id);
@@ -631,6 +667,7 @@ const UI = {
       </div>
       <div class="set-group">
         <div class="sg-title">📊 数据</div>
+        <div class="set-row"><button class="btn" style="width:100%;padding:12px;border:none;border-radius:12px;background:var(--primary);color:#fff;font-size:.95em;font-weight:700;cursor:pointer" onclick="App.redownloadModels()">🔄 重新下载识别模型（约68MB）</button></div>
         <div class="set-row"><button class="btn" style="width:100%;padding:12px;border:none;border-radius:12px;background:#e74c3c;color:#fff;font-size:.95em;font-weight:700;cursor:pointer" onclick="App.clearData()">清空所有学习数据</button></div>
       </div>
     </div>`;
@@ -642,7 +679,12 @@ const UI = {
   updateWhisperProgress() {
     const label = document.getElementById('whisper-dl-label');
     const fill = document.getElementById('whisper-dl-fill');
-    if (label) label.textContent = whisperDL.done ? '语音识别模型已就绪 ✓' : '语音识别模型下载中（国内加速）… ' + whisperDL.pct + '%';
+    let txt;
+    if (whisperLoadError) txt = '⚠️ 模型加载异常（见上方提示）';
+    else if (whisperDL.done) txt = '语音识别模型已就绪 ✓';
+    else if (whisperDLFail.length) txt = '部分文件下载失败，正在自动重试… ' + whisperDL.pct + '%';
+    else txt = '语音识别模型下载中（国内加速）… ' + whisperDL.pct + '%';
+    if (label) label.textContent = txt;
     if (fill) fill.style.width = whisperDL.pct + '%';
   },
   setNav(active) {
@@ -908,6 +950,16 @@ const App = {
     if (!confirm('确定清空所有学习数据吗？')) return;
     Object.keys(localStorage).forEach(k => { if (k.indexOf('gsp_') === 0) localStorage.removeItem(k); });
     location.hash = '#/';
+    location.reload();
+  },
+  async redownloadModels() {
+    if (!confirm('将清除并重新下载语音识别模型（约 68MB），确定吗？')) return;
+    try { await caches.delete('poem-model-cache-v1'); } catch (e) {}
+    try { await caches.delete('poem-model-cache-v2'); } catch (e) {}
+    try { await caches.delete('transformers-cache'); } catch (e) {}
+    whisperPipe = null; whisperFailed = false; whisperRetryAt = 0; whisperLoadError = '';
+    whisperDL.done = false; whisperDL.pct = 0; whisperDL.active = false; whisperDLFail = [];
+    location.hash = '#/recite';
     location.reload();
   },
 
