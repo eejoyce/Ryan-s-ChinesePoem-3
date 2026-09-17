@@ -336,6 +336,22 @@ function scheduleModelRetry() {
   }, 30000);
 }
 
+/* 手动重试加载语音模型（失败后点击"重新加载"按钮调用） */
+async function retryWhisperLoad() {
+  const box = document.getElementById('score-box');
+  if (box) { box.classList.remove('hidden'); box.innerHTML = '<div class="big">⏳</div><div class="msg">正在重新加载语音模型…</div>'; }
+  whisperFailed = false; whisperRetryAt = 0; whisperPipe = null; whisperLoadError = '';
+  try { await loadWhisper(); } catch (e) {}
+  if (box) {
+    if (whisperPipe) {
+      box.innerHTML = '<div class="big">✓</div><div class="msg">模型加载成功！请重新点击🎤开始背诵</div>';
+    } else {
+      box.innerHTML = `<div class="big">✗</div><div class="msg">仍加载失败</div>
+        <div class="msg" style="margin-top:6px;font-size:.72em;color:#7f8c8d">${esc(whisperLoadError || '')}</div>`;
+    }
+  }
+}
+
 /* 语音识别模型加载错误详情（用于页面诊断显示） */
 let whisperLoadError = '';
 
@@ -394,7 +410,7 @@ async function whisperTranscribe(blob) {
     const len = Math.round(src.length / ratio);
     const out = new Float32Array(len);
     for (let i = 0; i < len; i++) out[i] = src[Math.floor(i * ratio)];
-    const res = await pipe(out, { language: 'zh', task: 'transcribe' });
+    const res = await pipe(out, { language: 'zh', task: 'transcribe', max_new_tokens: 120 });
     whisperLastError = '';
     return (res && res.text) ? res.text : '';
   } catch (e) {
@@ -844,15 +860,18 @@ const App = {
     }
     // ③ 语音识别完全失败：不按时长评分，明确提示后让用户重试
     const reason = whisperFailed
-      ? '离线语音识别模型加载失败（请用 Edge / Chrome 浏览器打开，并保持网络通畅后重试）'
+      ? '离线语音识别模型加载失败（可点击下方“重新加载”重试，或请用 Edge / Chrome 浏览器打开）'
       : '未能识别到清晰语音（请靠近麦克风、放慢语速重新背诵，或在 Edge / Chrome 浏览器中打开）';
-    const dbg = whisperFailed
-      ? '模型状态：加载失败' + (whisperLastError ? ' · ' + whisperLastError : '')
+    const errDetail = whisperFailed
+      ? ('模型状态：加载失败'
+          + (whisperLoadError ? ' · ' + whisperLoadError.slice(0, 200) : '')
+          + (whisperLastError ? ' · 识别异常：' + whisperLastError : ''))
       : (whisperLastError ? '识别异常：' + whisperLastError : '');
     box.classList.remove('hidden');
     box.innerHTML = `<div class="big">--</div>
       <div class="msg">${reason}</div>
-      ${dbg ? `<div class="msg" style="margin-top:6px;font-size:.72em;color:#7f8c8d">${esc(dbg)}</div>` : ''}
+      ${errDetail ? `<div class="msg" style="margin-top:6px;font-size:.72em;color:#7f8c8d">${esc(errDetail)}</div>` : ''}
+      ${whisperFailed ? `<button class="btn" style="margin-top:8px" onclick="retryWhisperLoad()">🔄 重新加载语音模型</button>` : ''}
       <div class="msg" style="margin-top:6px;font-size:.8em">录音已保存可回放 · 点击🎤重新背诵</div>`;
     const playBtn = document.getElementById('play-rec');
     playBtn.disabled = false;
