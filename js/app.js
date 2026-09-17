@@ -276,6 +276,15 @@ const BIG_SOURCES = [
   '' // 空 = 同域（GitHub Pages）
 ];
 
+/* fetch 加超时（防止某个下载块连接挂起导致整体卡死） */
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms || 30000);
+  try {
+    return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+  } finally { clearTimeout(timer); }
+}
+
 /* 单个源的分块并发下载；任一块 4 次重试仍失败则返回 null */
 async function tryChunked(fullUrl, total) {
   const chunkSize = CHUNK_MB * 1024 * 1024;
@@ -294,7 +303,7 @@ async function tryChunked(fullUrl, total) {
       let ok = false;
       for (let retry = 0; retry < 4 && !ok; retry++) {
         try {
-          const r = await fetch(fullUrl, { headers: { Range: 'bytes=' + c.start + '-' + c.end } });
+          const r = await fetchWithTimeout(fullUrl, { headers: { Range: 'bytes=' + c.start + '-' + c.end } }, 30000);
           if (r.status === 200) {
             const buf = await r.arrayBuffer();
             if (!full) full = buf;
@@ -304,7 +313,7 @@ async function tryChunked(fullUrl, total) {
             ok = true;
           }
         } catch (e) {}
-        if (!ok) await new Promise(r => setTimeout(r, 800 + retry * 500));
+        if (!ok) await new Promise(r => setTimeout(r, 500 + retry * 300));
       }
       if (!ok) return false;
     }
@@ -344,7 +353,7 @@ async function downloadToCache(path) {
       await cache.put(url, new Response(buf, { headers: { 'Content-Type': 'application/octet-stream' } }));
       return true;
     }
-    const r = await fetch(remote);
+    const r = await fetchWithTimeout(remote, {}, 30000);
     if (r.ok) { await cache.put(url, r.clone()); return true; }
   } catch (e) {}
   return false;
