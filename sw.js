@@ -21,8 +21,12 @@ self.addEventListener('fetch', (e) => {
     const cache = await caches.open(CACHE);
     const hit = await cache.match(e.request);
     if (hit) return hit;
-    // 超 20MB 的大模型文件：jsDelivr 拒 403，直接同域（GitHub Pages）回源（页面已用 Range 分块并发预下载）
+    // 超 20MB 的大模型文件：jsDelivr 拒 403 → 先走 ghfast.top 国内加速（支持 CORS/Range），失败再同域回源
     if (url.pathname.includes('decoder_model_merged_quantized.onnx')) {
+      try {
+        const fast = await fetch('https://ghfast.top/https://raw.githubusercontent.com/eejoyce/Ryan-s-ChinesePoem-3/main' + url.pathname);
+        if (fast.ok) { cache.put(e.request, fast.clone()); return fast; }
+      } catch (err) {}
       try { return await fetch(e.request); } catch (err) { return new Response('', { status: 502 }); }
     }
     try {

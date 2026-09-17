@@ -270,10 +270,14 @@ const BIG_FILES = [
 ];
 const CHUNK_MB = 3; // 每块 3MB
 const CHUNK_CONC = 6; // 并发块数
+// 大文件（decoder）下载源链：ghfast.top 国内加速（快、CORS、支持 Range）→ 同域 GitHub Pages（慢但稳）
+const BIG_SOURCES = [
+  'https://ghfast.top/https://raw.githubusercontent.com/eejoyce/Ryan-s-ChinesePoem-3/main',
+  '' // 空 = 同域（GitHub Pages）
+];
 
-/* 大文件：Range 分块并发下载（GitHub Pages 单连接慢速，并发 6 块可提速 5-8 倍） */
-async function downloadChunked(path, url) {
-  const total = 30727765; // decoder_model_merged_quantized.onnx 字节数
+/* 单个源的分块并发下载；任一块 4 次重试仍失败则返回 null */
+async function tryChunked(fullUrl, total) {
   const chunkSize = CHUNK_MB * 1024 * 1024;
   const chunks = [];
   for (let s = 0; s < total; s += chunkSize) {
@@ -290,7 +294,7 @@ async function downloadChunked(path, url) {
       let ok = false;
       for (let retry = 0; retry < 4 && !ok; retry++) {
         try {
-          const r = await fetch(url, { headers: { Range: 'bytes=' + c.start + '-' + c.end } });
+          const r = await fetch(fullUrl, { headers: { Range: 'bytes=' + c.start + '-' + c.end } });
           if (r.status === 200) {
             const buf = await r.arrayBuffer();
             if (!full) full = buf;
@@ -315,6 +319,17 @@ async function downloadChunked(path, url) {
   let off = 0;
   for (const b of results) { buf.set(new Uint8Array(b), off); off += b.byteLength; }
   return buf.buffer;
+}
+
+/* 大文件：多源 failover 分块并发下载（国内加速源失败自动换同域） */
+async function downloadChunked(path, url) {
+  const total = 30727765; // decoder_model_merged_quantized.onnx 字节数
+  for (const prefix of BIG_SOURCES) {
+    const fullUrl = prefix ? prefix + '/' + path : url;
+    const buf = await tryChunked(fullUrl, total);
+    if (buf && buf.byteLength === total) return buf;
+  }
+  return null;
 }
 
 async function downloadToCache(path) {
