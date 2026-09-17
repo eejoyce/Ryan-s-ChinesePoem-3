@@ -443,7 +443,9 @@ async function loadWhisper() {
   try {
     let mod = window.__transformersModule;
     if (!mod) {
-      mod = await import('./js/transformers.js');
+      // 必须用基于页面地址的绝对 URL：部分手机浏览器把相对路径按“当前脚本所在目录”解析，
+      // 会变成 js/js/transformers.js 导致加载失败（桌面正常、手机一直失败的根因）
+      mod = await import(new URL('js/transformers.js', location.href).href);
       window.__transformersModule = mod;
     }
     const { pipeline, env } = mod;
